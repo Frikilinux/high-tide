@@ -18,12 +18,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import logging
+import os
 import random
 import threading
 import base64
 from enum import IntEnum
 from gettext import gettext as _
-from pathlib import Path
 from typing import Any, List, Union
 
 from gi.repository import GLib, GObject, Gst, Gio
@@ -145,6 +145,12 @@ class PlayerObject(GObject.GObject):
 
         # next track variables for gapless
         self.next_track: Any | None = None
+
+        # keys of downloads currently in flight, so skipping back and forth over
+        # the same track does not launch several ffmpeg processes that all
+        # write to the same .tmp file
+        self._cache_lock = threading.Lock()
+        self._caching_keys: set = set()
 
         # for not caching on metered networks
         self.monitor = Gio.NetworkMonitor.get_default()
@@ -492,10 +498,16 @@ class PlayerObject(GObject.GObject):
 
             major, minor, micro, nano = Gst.version()
             if (major, minor) >= (1, 26):
-                # Write manifest to temp location for GStreamer and caching
-                mpd_path = Path(utils.CACHE_DIR, "manifest.mpd")
-                with open(mpd_path, "w") as f:
+                # Write manifest to a per-track location for GStreamer and caching.
+                # Each (track, quality) gets its own file, and the write is atomic:
+                # renaming into place means a manifest GStreamer already has open
+                # keeps reading the complete old inode instead of seeing a rewrite
+                # at its current offset.
+                mpd_path = utils.MPD_DIR / f"{track.id}_{utils.session.audio_quality}.mpd"
+                mpd_tmp = mpd_path.with_suffix(".mpd.part")
+                with open(mpd_tmp, "w") as f:
                     f.write(data)
+                os.replace(mpd_tmp, mpd_path)
 
                 if not self.monitor.get_network_metered():
                     threading.Thread(
@@ -526,9 +538,28 @@ class PlayerObject(GObject.GObject):
 
         raise AttributeError(f"Unhandled manifest mime type: {self.stream.manifest_mime_type}")
 
+    def _begin_cache(self, cached_music) -> bool:
+        """Claim the download slot for a cached file.
+
+        Returns False when a download for this file is already running, which
+        happens when the user skips back and forth over the same track.
+        """
+        with self._cache_lock:
+            if cached_music in self._caching_keys:
+                return False
+            self._caching_keys.add(cached_music)
+            return True
+
+    def _end_cache(self, cached_music) -> None:
+        with self._cache_lock:
+            self._caching_keys.discard(cached_music)
+
     def _cache_mpd_track(self, track, mpd_path):
         """Download and cache MPD track via ffmpeg in background."""
         cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
+        if not self._begin_cache(cached_music):
+            logger.debug(f"Already caching MPD track: {track.id}")
+            return
         tmp = cached_music.with_suffix(".tmp")
 
         try:
@@ -555,10 +586,15 @@ class PlayerObject(GObject.GObject):
         except Exception as e:
             logger.warning(f"Failed to cache MPD track {track.id}: {e}")
             tmp.unlink(missing_ok=True)
+        finally:
+            self._end_cache(cached_music)
 
     def _cache_bts_track(self, track, stream_url):
         """Download and cache BTS track in background."""
         cached_music = utils.MUSIC_DIR / f"{track.id}_{utils.session.audio_quality}.m4a"
+        if not self._begin_cache(cached_music):
+            logger.debug(f"Already caching BTS track: {track.id}")
+            return
         tmp = cached_music.with_suffix(".tmp")
 
         try:
@@ -573,9 +609,12 @@ class PlayerObject(GObject.GObject):
                 logger.info(f"Cached BTS track: {track.id}")
             else:
                 logger.warning(f"BTS download failed for {track.id}: HTTP {response.status_code}")
+                tmp.unlink(missing_ok=True)
         except Exception as e:
             logger.warning(f"Failed to cache BTS track {track.id}: {e}")
             tmp.unlink(missing_ok=True)
+        finally:
+            self._end_cache(cached_music)
 
     def apply_replaygain_tags(self):
         """Apply ReplayGain normalization tags to the current track if enabled."""

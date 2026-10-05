@@ -55,6 +55,26 @@ playlist_and_favorite_playlists: List[Playlist] = []
 user_playlists: List[Playlist] = []
 
 
+def cleanup_partial_downloads(cache_dir) -> None:
+    """Remove leftover .tmp files from a previous run.
+
+    Track downloads are staged through a .tmp file and renamed into place only
+    once complete. If the app is killed mid-download the staging file survives,
+    so these are always incomplete by definition and safe to drop at startup.
+    """
+    if not cache_dir or not cache_dir.exists():
+        return
+
+    for f in cache_dir.iterdir():
+        if f.suffix == ".tmp":
+            try:
+                size = f.stat().st_size
+                f.unlink()
+                logger.info(f"Removed partial download: {f.name} ({size} bytes)")
+            except OSError as e:
+                logger.warning(f"Could not remove partial download {f.name}: {e}")
+
+
 def init() -> None:
     """Initialize the utils module by setting up cache directories and global objects.
 
@@ -76,6 +96,11 @@ def init() -> None:
     global MUSIC_DIR
     MUSIC_DIR = Path(CACHE_DIR, "music")
     MUSIC_DIR.mkdir(exist_ok=True)
+    cleanup_partial_downloads(MUSIC_DIR)
+
+    global MPD_DIR
+    MPD_DIR = Path(CACHE_DIR, "manifests")
+    MPD_DIR.mkdir(exist_ok=True)
 
     global session
     global navigation_view
@@ -816,7 +841,7 @@ def setup_logging():
 
     handlers = []
     if log_to_file:
-        handlers.append(logging.FileHandler(CACHE_DIR + "/high-tide.log"))
+        handlers.append(logging.FileHandler(Path(CACHE_DIR) / "high-tide.log"))
     handlers.append(logging.StreamHandler())
 
     logging.basicConfig(
